@@ -31,124 +31,132 @@
 const std::string database_name = "database";
 const std::string database_temp_name = "database_temp";
 
-int db_get(const std::string &key, std::string &value) {
-  std::ifstream database(database_name);
-  std::string line;
-  if (!database.is_open()) {
-    std::cerr << "Database could not be opened" << endl;
-    return EXIT_FAILURE;
+enum class DbError {
+  SUCCESS = 0,
+  FILE_OPEN_FAILED,
+  FILE_LOCK_FAIL,
+  FSYNC_FAIL,
+  RENAME_FAIL,
+  KEY_NOT_FOUND,
+};
+
+void logError(const std::string &message) { std::cerr << message << endl; }
+
+bool lockDatabase(int fd) {
+  if (flock(fd, LOCK_EX) == -1) {
+    logError("Failed to acquire file lock");
+    return false;
   }
+  return true;
+}
+
+bool unlockDatabase(int fd) {
+  if (flock(fd, LOCK_UN) == -1) {
+    logError("Failed to release file lock");
+    return false;
+  }
+  return true;
+}
+
+DbError db_get(const std::string &key, std::string &value) {
+  std::ifstream database(database_name);
+  if (!database.is_open()) {
+    logError("Failed to open database");
+    return DbError::FILE_OPEN_FAILED;
+  }
+
+  std::string line;
   while (std::getline(database, line)) {
-    std::stringstream ss(line);
-    std::string stored_key;
-    if (std::getline(ss, stored_key, ',') && stored_key == key) {
-      std::getline(ss, value);
-      return EXIT_SUCCESS;
+    std::stringstream current_line(line);
+    std::string key_stored;
+    if (getline(current_line, key_stored, ',') && key_stored == key) {
+      getline(current_line, value);
+      database.close();
+      return DbError::SUCCESS;
     }
   }
   database.close();
-
-  return EXIT_FAILURE;
+  return DbError::KEY_NOT_FOUND;
 }
 
-int db_set(const std::string &key, const std::string &value) {
-  // 0644 represents the permissions (TBS)
-  int temp_fd = open(database_temp_name.c_str(), O_WRONLY | O_CREAT, 0644);
-  if (temp_fd == -1) {
-    std::cerr << "Failed to open temporary database for open/create" << endl;
-    close(temp_fd);
-    return EXIT_FAILURE;
+DbError db_set(const std::string &key, const std::string &value) {
+  int fd_db = open(database_temp_name.c_str(), O_WRONLY | O_CREAT, 0644);
+  if (fd_db == -1) {
+    logError("Failed to open temporary database file");
+    return DbError::FILE_OPEN_FAILED;
   }
 
-  int db_fd = open(database_name.c_str(), O_RDWR);
-  if (db_fd == -1) {
-    std::cerr << "Failed to open database file for locking" << endl;
-    close(db_fd);
-    return EXIT_FAILURE;
+  if (!lockDatabase(fd_db)) {
+    close(fd_db);
+    return DbError::FILE_LOCK_FAIL;
   }
 
-  // we need to lock temp_fd
-  if (flock(db_fd, LOCK_EX) == -1) {
-    std::cerr << "Failed to lock the file" << endl;
-    close(db_fd);
-    close(temp_fd);
-    return EXIT_FAILURE;
-  }
-
-  // we need to copy content from database to temp database
-  std::ifstream database_stream(database_name);
-  std::ofstream temp_database_stream(database_temp_name);
-  if (!database_stream.is_open() || !temp_database_stream.is_open()) {
-    std::cerr << "Failed to open database files" << endl;
-    close(db_fd);
-    close(temp_fd);
-    return EXIT_FAILURE;
+  std::ifstream database(database_name);
+  std::ofstream database_temp(database_temp_name);
+  if (!database.is_open() || !database_temp.is_open()) {
+    logError("Failed to open databases");
+    unlockDatabase(fd_db);
+    close(fd_db);
+    return DbError::FILE_OPEN_FAILED;
   }
 
   std::string line;
-  while (std::getline(database_stream, line)) {
-    temp_database_stream << line << "\n";
+  while (std::getline(database, line)) {
+    database_temp << line << endl;
   }
+  database.close();
+  database_temp << key << "," << value << endl;
+  database_temp.close();
 
-  database_stream.close();
-
-  // add new record passed as args
-  temp_database_stream << key << "," << value << endl;
-  temp_database_stream.close();
-
-  if (fsync(temp_fd) == -1) {
-    std::cerr << "fsync failed on temp" << endl;
-    close(db_fd);
-    close(temp_fd);
-    return EXIT_FAILURE;
+  if (fsync(fd_db) == -1) {
+    logError("fsync failed");
+    unlockDatabase(fd_db);
+    close(fd_db);
+    return DbError::FSYNC_FAIL;
   }
-  close(temp_fd);
 
   if (rename(database_temp_name.c_str(), database_name.c_str()) == -1) {
-    std::cerr << "Failed to rename database file" << endl;
-    close(db_fd);
-    return EXIT_FAILURE;
+    logError("Failed to rename temporary database to main database");
+    unlockDatabase(fd_db);
+    close(fd_db);
+    return DbError::RENAME_FAIL;
   }
 
-  if (flock(db_fd, LOCK_UN) == -1) {
-    std::cerr << "Failed to release lock on database file" << endl;
-    close(db_fd);
-    return EXIT_FAILURE;
+  if (!unlockDatabase(fd_db)) {
+    close(fd_db);
+    return DbError::FILE_LOCK_FAIL;
   }
 
-  close(db_fd);
-  return EXIT_SUCCESS;
+  close(fd_db);
+  return DbError::SUCCESS;
 }
 
 int main(int argc, char **argv) {
   if (argc < 3) {
-    std::cerr << "USAGE : " << argv[0] << " {get|set} key [value]" << endl;
+    logError("USAGE: " + std::string(argv[0]) + " {get|set} key [value]");
     return EXIT_FAILURE;
   }
 
-  // op is whether set or get
-  const std::string operation = *(argv + 1);
-  const std::string key = *(argv + 2);
+  const std::string operation = argv[1];
+  const std::string key = argv[2];
 
   if (operation == "set") {
     if (argc < 4) {
-      std::cerr << "USAGE : " << argv[0] << " set key value" << endl;
+      logError("USAGE: " + std::string(argv[0]) + " set key value");
       return EXIT_FAILURE;
     }
-    // now we have the key and value, we need to store them in the database
-    const std::string value = *(argv + 3);
-    const int set_status = db_set(key, value);
-    // if db_set mess up!
-    if (set_status == 1) {
-      std::cerr << "DB_SET is not working as expected" << endl;
+    const std::string value = argv[3];
+    DbError set_status = db_set(key, value);
+    if (set_status != DbError::SUCCESS) {
+      logError("Failed to set key-value in the database");
       return EXIT_FAILURE;
     }
     std::cout << "New record has been inserted in the database." << endl;
   } else if (operation == "get") {
     std::string value;
-    const int get_status = db_get(key, value);
-    if (get_status == 1) {
-      std::cerr << "DB_GET is not working as expected" << endl;
+    DbError get_status = db_get(key, value);
+    if (get_status != DbError::SUCCESS) {
+      logError("Failed to get key from the database");
       return EXIT_FAILURE;
     }
     if (!value.empty()) {
@@ -157,7 +165,7 @@ int main(int argc, char **argv) {
       std::cout << "Key is not found in the database" << endl;
     }
   } else {
-    std::cerr << "USAGE : " << argv[0] << " set key value" << endl;
+    logError("USAGE: " + std::string(argv[0]) + " {get|set} key [value]");
     return EXIT_FAILURE;
   }
 
